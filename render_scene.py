@@ -10,34 +10,63 @@ def seconds_to_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def group_words(captions, group_size=3):
-    """Combine consecutive words into chunks, e.g. 3 words shown together
-    for the span from the first word's start to the last word's end."""
+def split_into_groups(captions, max_group_size=3, max_chars=19):
+    """Build groups of up to max_group_size words, but close a group early
+    (even below max_group_size) if adding the next word would push the
+    combined text past max_chars characters. Also always closes a group
+    right after sentence-ending punctuation."""
+    sentence_enders = (".", "!", "?")
     groups = []
-    for i in range(0, len(captions), group_size):
-        chunk = captions[i:i + group_size]
-        groups.append({
-            "start": chunk[0]["start"],
-            "end": chunk[-1]["end"],
-            "word": " ".join(w["word"].strip() for w in chunk),
-        })
+    current = []
+
+    for word in captions:
+        text = word["word"].strip()
+        candidate = current + [word]
+        candidate_text = " ".join(w["word"].strip() for w in candidate)
+
+        too_many_words = len(candidate) > max_group_size
+        too_long = len(candidate_text) > max_chars and len(current) >= 1
+
+        if (too_many_words or too_long) and current:
+            groups.append(current)
+            current = [word]
+        else:
+            current.append(word)
+
+        if text.endswith(sentence_enders):
+            groups.append(current)
+            current = []
+
+    if current:
+        groups.append(current)
+
     return groups
 
 
-def captions_to_srt(captions, srt_path, group_size=3):
-    grouped = group_words(captions, group_size)
+def captions_to_srt(captions, srt_path, max_group_size=3, max_chars=19):
+    """Progressive reveal: within each group, each new word appears at the
+    moment it's spoken, building up the line (e.g. 'This' -> 'This is'),
+    then the next group starts fresh."""
+    groups = split_into_groups(captions, max_group_size=max_group_size, max_chars=max_chars)
+    entry_num = 1
+
     with open(srt_path, "w", encoding="utf-8") as f:
-        for i, word in enumerate(grouped, start=1):
-            start = seconds_to_srt_time(word["start"])
-            end = seconds_to_srt_time(word["end"])
-            text = word["word"]
-            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+        for group in groups:
+            for j, word in enumerate(group):
+                cumulative_text = " ".join(w["word"].strip() for w in group[:j + 1])
+                start = word["start"]
+                # Ends right when the next word starts (or at this word's own
+                # end if it's the last word in the group).
+                end = group[j + 1]["start"] if j + 1 < len(group) else word["end"]
+
+                f.write(f"{entry_num}\n{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n{cumulative_text}\n\n")
+                entry_num += 1
 
 
 def render_scene(image_path, audio_path, captions, output_path,
-                  font_name="Impact", group_size=2):
+                  font_name="Impact", max_group_size=3, max_chars=19):
     srt_path = output_path.replace(".mp4", ".srt")
-    captions_to_srt(captions, srt_path, group_size=group_size)
+    captions_to_srt(captions, srt_path, max_group_size=max_group_size, max_chars=max_chars)
 
     # FFmpeg subtitle filter needs forward slashes and escaped colons on Windows.
     srt_filter_path = srt_path.replace("\\", "/").replace(":", "\\:")
@@ -46,7 +75,8 @@ def render_scene(image_path, audio_path, captions, output_path,
     # is short), MarginV pushes them up from the very bottom edge in pixels.
     style = (
         f"FontName={font_name},FontSize=17,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Alignment=2,MarginV=60"
+        "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=1,"
+        "Alignment=2,MarginV=80"
     )
 
     cmd = [

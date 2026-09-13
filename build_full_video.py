@@ -50,7 +50,8 @@ def build_full_video(project_path="project_output/project.json"):
             captions=scene["captions"],
             output_path=output_path,
             font_name="Impact",
-            group_size=2,
+            max_group_size=3,
+            max_chars=19,
         )
 
         if ok:
