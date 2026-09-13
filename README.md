@@ -3,7 +3,6 @@
 A tool that turns a topic and a target duration into a short video complete with an AI-written script, AI-generated images, an AI voiceover, and
 synced captions using free APIs so it costs little to nothing to run.
 
-
 ## What it does
 
 1. Writes a script, split into scenes, using Google's Gemini AI.
@@ -13,14 +12,12 @@ synced captions using free APIs so it costs little to nothing to run.
 5. Renders each scene into a short video clip with the image, voice, and captions burned in.
 6. Joins all the scene clips into one final video.
 
-
 ## What you need
 
 - Python 3.10 or newer
 - FFmpeg (a free video-processing tool) installed on your computer
 - A Gemini API key (from Google AI Studio)
 - A Pollinations API key (from auth.pollinations.ai)
-
 
 ## Project files
 
