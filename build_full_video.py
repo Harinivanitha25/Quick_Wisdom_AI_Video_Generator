@@ -13,7 +13,85 @@ def slugify(text, max_length=60):
     return text[:max_length].strip("_") or "untitled"
 
 
- 
+def get_duration(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return float(result.stdout.strip())
+
+
+def concatenate_with_transitions(video_paths, output_path,
+                                  transition="fade", transition_duration=0.5):
+    """Join scenes with a crossfade between each, instead of an instant cut.
+    Needs real re-encoding (no -c copy), so this takes longer than a plain
+    concat, but produces an actual transition rather than a hard cut."""
+    if len(video_paths) == 1:
+        # Nothing to transition between - just re-encode isn't even needed,
+        # copy the single scene straight through.
+        cmd = ["ffmpeg", "-y", "-i", video_paths[0], "-c", "copy", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("Single-scene copy failed:")
+            print(result.stderr[-2000:])
+            return False
+        print(f"\nFinal video saved: {output_path}")
+        return True
+
+    durations = [get_duration(p) for p in video_paths]
+
+    inputs = []
+    for p in video_paths:
+        inputs += ["-i", p]
+
+    filter_parts = []
+    running_duration = durations[0]
+    prev_v, prev_a = "0:v", "0:a"
+
+    for i in range(1, len(video_paths)):
+        offset = max(0, running_duration - transition_duration)
+        v_label, a_label = f"v{i}", f"a{i}"
+
+        filter_parts.append(
+            f"[{prev_v}][{i}:v]xfade=transition={transition}:"
+            f"duration={transition_duration}:offset={offset:.3f}[{v_label}]"
+        )
+        filter_parts.append(
+            f"[{prev_a}][{i}:a]acrossfade=d={transition_duration}[{a_label}]"
+        )
+
+        running_duration = running_duration + durations[i] - transition_duration
+        prev_v, prev_a = v_label, a_label
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{prev_v}]",
+        "-map", f"[{prev_a}]",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("Transition build failed:")
+        print(result.stderr[-2000:])
+        return False
+
+    print(f"\nFinal video saved: {output_path}")
+    return True
+
+
 def concatenate_videos(video_paths, output_path):
     list_path = "project_output/concat_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
@@ -79,10 +157,10 @@ def build_full_video(project_path="project_output/project.json"):
         print("No scenes rendered successfully, stopping.")
         return
 
-    print(f"\nConcatenating {len(scene_videos)} scenes...")
+    print(f"\nJoining {len(scene_videos)} scenes with transitions...")
     filename = slugify(project["title"])
     output_path = f"project_output/{filename}.mp4"
-    concatenate_videos(scene_videos,output_path)
+    concatenate_with_transitions(scene_videos, output_path, transition="fade", transition_duration=0.5)
 
 
 if __name__ == "__main__":

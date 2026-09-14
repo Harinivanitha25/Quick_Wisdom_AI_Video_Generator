@@ -97,12 +97,12 @@ def captions_to_ass(captions, ass_path, video_width, video_height,
     # One scale factor drives every size below. MIN_SCALE keeps it from
     # shrinking captions past a readable floor on shorter/moderate videos.
     scale = max(MIN_SCALE, video_height / REFERENCE_HEIGHT)
-    fontsize = round(BASE_FONTSIZE * scale )
-    margin_lr = round(BASE_MARGIN_LR * scale )
-    if video_height==1920:
-        margin_v=420
+    fontsize = round(BASE_FONTSIZE * scale)
+    margin_lr = round(BASE_MARGIN_LR * scale)
+    if video_height == 1920:
+        margin_v = 420
     else:
-        margin_v=180
+        margin_v = 180
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -159,12 +159,22 @@ def render_scene(image_path, audio_path, captions, output_path,
     # FFmpeg's subtitle filters need forward slashes and escaped colons on Windows.
     ass_filter_path = ass_path.replace("\\", "/").replace(":", "\\:")
 
+    # Force every scene to the exact target resolution, regardless of what
+    # size the source image actually came back as (Pollinations sometimes
+    # returns dimensions slightly off from what was requested, e.g. rounded
+    # to a multiple of 8/64) - without this, scenes can end up with
+    # mismatched sizes that break the crossfade transitions between them.
+    scale_pad = (
+        f"scale={video_width}:{video_height}:force_original_aspect_ratio=decrease,"
+        f"pad={video_width}:{video_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
+
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
         "-i", image_path,
         "-i", audio_path,
-        "-vf", f"ass='{ass_filter_path}'",
+        "-vf", f"{scale_pad},ass='{ass_filter_path}'",
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-c:a", "aac",
