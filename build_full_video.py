@@ -1,9 +1,19 @@
 import json
+import re
 import subprocess
 
 from render_scene import render_scene
 
+def slugify(text, max_length=60):
+    """Turn a title into a safe filename: lowercase, spaces to underscores,
+    strip anything that isn't a letter/number/underscore/hyphen."""
+    text = text.strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s]+", "_", text)
+    return text[:max_length].strip("_") or "untitled"
 
+
+ 
 def concatenate_videos(video_paths, output_path):
     list_path = "project_output/concat_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
@@ -70,7 +80,9 @@ def build_full_video(project_path="project_output/project.json"):
         return
 
     print(f"\nConcatenating {len(scene_videos)} scenes...")
-    concatenate_videos(scene_videos, "project_output/final_video.mp4")
+    filename = slugify(project["title"])
+    output_path = f"project_output/{filename}.mp4"
+    concatenate_videos(scene_videos,output_path)
 
 
 if __name__ == "__main__":
