@@ -18,16 +18,22 @@ GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
+
+FRAME_SIZES = {
+    "9:16": (1080, 1920),
+    "16:9": (1920, 1080),
+}
+
 # Loaded once and reused for every scene, rather than reloading per scene.
 whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
 
 def generate_script(topic, duration_seconds):
     words_needed = int(duration_seconds / 60 * 150)  # ~150 words per minute of narration
-    num_scenes = max(3, duration_seconds // 5)  # roughly one scene per 8 seconds
+    num_scenes = max(2, duration_seconds // 5)  # roughly one scene per 5 seconds
 
     prompt = f"""Write a YouTube video script about: {topic}
-                 Target length: about {words_needed} words total, split into {num_scenes} scenes. Add "Follow Quick Wisdom for more" as last scene. 
+                 Target length: about {words_needed} words total, split into {num_scenes} scenes. Add "Follow Quick Wisdom for more" as last scene.
                  Return ONLY valid JSON in this exact format, no other text:
 {{
   "title": "video title",
@@ -53,10 +59,10 @@ def generate_script(topic, duration_seconds):
     return json.loads(raw_text)
 
 
-def generate_image(prompt, filename):
+def generate_image(prompt, filename, width, height):
     encoded = urllib.parse.quote(prompt)
     url = f"https://gen.pollinations.ai/image/{encoded}"
-    params = {"width": 720, "height": 1280, "model": "flux"}
+    params = {"width": width, "height": height, "model": "flux"}
     headers = {"Authorization": f"Bearer {POLLINATION_API_KEY}"}
 
     response = requests.get(url, params=params, headers=headers)
@@ -85,8 +91,16 @@ def generate_captions(audio_path):
     return words
 
 
-def process_script(script):
-    project = {"title": script["title"], "scenes": []}
+def process_script(script, frame_size="9:16"):
+    width, height = FRAME_SIZES[frame_size]
+
+    project = {
+        "title": script["title"],
+        "frame_size": frame_size,
+        "video_width": width,
+        "video_height": height,
+        "scenes": [],
+    }
     total = len(script["scenes"])
 
     for i, scene in enumerate(script["scenes"]):
@@ -95,7 +109,7 @@ def process_script(script):
         image_path = f"{PROJECT_DIR}/images/scene_{i}.png"
         audio_path = f"{PROJECT_DIR}/audio/scene_{i}.mp3"
 
-        ok = generate_image(scene["image_prompt"], image_path)
+        ok = generate_image(scene["image_prompt"], image_path, width, height)
         if not ok:
             image_path = None
 
@@ -123,13 +137,14 @@ def process_script(script):
 
 if __name__ == "__main__":
     topic = "UN adopts new world map"
-    duration_seconds = 30
+    duration_seconds = 10
+    frame_size = "9:16"  # or "16:9"
 
-    print(f"Generating script for: {topic} ({duration_seconds}s)")
+    print(f"Generating script for: {topic} ({duration_seconds}s, {frame_size})")
     script = generate_script(topic, duration_seconds)
 
     if script is None:
         print("Script generation failed, stopping.")
     else:
         print("Script generated:", script["title"])
-        process_script(script)
+        process_script(script, frame_size=frame_size)

@@ -38,6 +38,12 @@ def build_full_video(project_path="project_output/project.json"):
     with open(project_path) as f:
         project = json.load(f)
 
+    # Pulled from the project file (set when the assets were generated) so
+    # this always matches the actual image dimensions, instead of guessing.
+    video_width = project.get("video_width", 1080)
+    video_height = project.get("video_height", 1920)
+    print(f"Rendering at {video_width}x{video_height} ({project.get('frame_size', 'unknown')})")
+
     scene_videos = []
 
     for i, scene in enumerate(project["scenes"]):
@@ -49,9 +55,9 @@ def build_full_video(project_path="project_output/project.json"):
             audio_path=scene["audio_path"],
             captions=scene["captions"],
             output_path=output_path,
-            font_name="Impact",
-            max_group_size=3,
-            max_chars=19,
+            video_width=video_width,
+            video_height=video_height,
+            max_group_size=6,
         )
 
         if ok:

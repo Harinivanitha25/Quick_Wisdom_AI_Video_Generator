@@ -1,39 +1,50 @@
 import json
+import re
+import string
 import subprocess
 
+# Common short/function words that should never become the "hero" word,
+# even if nothing else in the group qualifies.
+STOPWORDS = {
+    "i'm", "i", "a", "an", "the", "is", "are", "was", "were", "to", "of",
+    "in", "on", "for", "and", "or", "but", "it's", "that", "this", "my",
+    "your", "old", "so", "as", "at", "be", "do", "did", "has", "have",
+}
 
-def seconds_to_srt_time(seconds):
+# The font/margin numbers below (100, 130, 120, 420) were tuned by eye for
+# a video at this height. Every size scales proportionally from here, so
+# any other resolution (a different vertical size, or landscape 16:9)
+# automatically gets correctly-proportioned text instead of needing its
+# own separate hardcoded numbers.
+REFERENCE_HEIGHT = 1920
+MIN_SCALE = 0.80
+
+BASE_FONTSIZE = 100
+BASE_HERO_FONTSIZE = 130
+BASE_NUMBER_FONTSIZE = 100
+BASE_MARGIN_LR = 120
+BASE_MARGIN_V = 420
+
+
+def seconds_to_ass_time(seconds):
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    secs = seconds % 60
+    return f"{hours:d}:{minutes:02d}:{secs:05.2f}"
 
 
-def split_into_groups(captions, max_group_size=3, max_chars=19):
-    """Build groups of up to max_group_size words, but close a group early
-    (even below max_group_size) if adding the next word would push the
-    combined text past max_chars characters. Also always closes a group
-    right after sentence-ending punctuation."""
+def split_into_groups(captions, max_group_size=6):
+    """Build groups of up to max_group_size words. Also always closes a
+    group right after sentence-ending punctuation, regardless of size."""
     sentence_enders = (".", "!", "?")
     groups = []
     current = []
 
     for word in captions:
         text = word["word"].strip()
-        candidate = current + [word]
-        candidate_text = " ".join(w["word"].strip() for w in candidate)
+        current.append(word)
 
-        too_many_words = len(candidate) > max_group_size
-        too_long = len(candidate_text) > max_chars and len(current) >= 1
-
-        if (too_many_words or too_long) and current:
-            groups.append(current)
-            current = [word]
-        else:
-            current.append(word)
-
-        if text.endswith(sentence_enders):
+        if len(current) >= max_group_size or text.endswith(sentence_enders):
             groups.append(current)
             current = []
 
@@ -43,48 +54,117 @@ def split_into_groups(captions, max_group_size=3, max_chars=19):
     return groups
 
 
-def captions_to_srt(captions, srt_path, max_group_size=3, max_chars=19):
-    """Progressive reveal: within each group, each new word appears at the
-    moment it's spoken, building up the line (e.g. 'This' -> 'This is'),
-    then the next group starts fresh."""
-    groups = split_into_groups(captions, max_group_size=max_group_size, max_chars=max_chars)
-    entry_num = 1
+def is_number_word(text):
+    return bool(re.search(r"\d", text))
 
-    with open(srt_path, "w", encoding="utf-8") as f:
+
+def choose_hero_word(group):
+    """Pick the word to render big/bold: the longest word that isn't a
+    number and isn't a common short/function word. Returns the word dict,
+    or None if nothing in the group qualifies."""
+    candidates = []
+    for w in group:
+        text = w["word"].strip()
+        clean = text.strip(string.punctuation).lower()
+        if is_number_word(text):
+            continue
+        if clean in STOPWORDS or len(clean) < 4:
+            continue
+        candidates.append(w)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda w: len(w["word"].strip()))
+
+
+def style_word(text, is_number, is_hero, scale):
+    """Wrap a word in ASS inline override tags for its type, then reset
+    back to the Default style so the next word isn't affected. Font sizes
+    are scaled to match the current video's resolution."""
+    if is_hero:
+        size = round(BASE_HERO_FONTSIZE * scale)
+        return f"{{\\fnInter\\fs{size}\\b1\\i1}}{text}{{\\r}}"
+    if is_number:
+        size = round(BASE_NUMBER_FONTSIZE * scale)
+        return f"{{\\fnInter\\i1\\fs{size}\\1c&HE0F5FF&}}{text}{{\\r}}"
+    return text
+
+
+def captions_to_ass(captions, ass_path, video_width, video_height,
+                     max_group_size=6):
+    groups = split_into_groups(captions, max_group_size=max_group_size)
+
+    # One scale factor drives every size below. MIN_SCALE keeps it from
+    # shrinking captions past a readable floor on shorter/moderate videos.
+    scale = max(MIN_SCALE, video_height / REFERENCE_HEIGHT)
+    fontsize = round(BASE_FONTSIZE * scale )
+    margin_lr = round(BASE_MARGIN_LR * scale )
+    if video_height==1920:
+        margin_v=420
+    else:
+        margin_v=180
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {video_width}
+PlayResY: {video_height}
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Inter,{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,2,2,2,{margin_lr},{margin_lr},{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+
         for group in groups:
-            for j, word in enumerate(group):
-                cumulative_text = " ".join(w["word"].strip() for w in group[:j + 1])
-                start = word["start"]
-                # Ends right when the next word starts (or at this word's own
-                # end if it's the last word in the group).
-                end = group[j + 1]["start"] if j + 1 < len(group) else word["end"]
+            hero = choose_hero_word(group)
+            hero_id = id(hero) if hero else None
 
-                f.write(f"{entry_num}\n{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n{cumulative_text}\n\n")
-                entry_num += 1
+            for j, word in enumerate(group):
+                revealed = group[: j + 1]
+                parts = []
+                for w in revealed:
+                    text = w["word"].strip()
+                    parts.append(style_word(
+                        text,
+                        is_number=is_number_word(text),
+                        is_hero=(id(w) == hero_id),
+                        scale=scale,
+                    ))
+                line = " ".join(parts)
+
+                start = word["start"]
+                end = revealed[-1]["end"] if j + 1 == len(group) else group[j + 1]["start"]
+
+                f.write(
+                    f"Dialogue: 0,{seconds_to_ass_time(start)},{seconds_to_ass_time(end)},"
+                    f"Default,,0,0,0,,{line}\n"
+                )
 
 
 def render_scene(image_path, audio_path, captions, output_path,
-                  font_name="Impact", max_group_size=3, max_chars=19):
-    srt_path = output_path.replace(".mp4", ".srt")
-    captions_to_srt(captions, srt_path, max_group_size=max_group_size, max_chars=max_chars)
-
-    # FFmpeg subtitle filter needs forward slashes and escaped colons on Windows.
-    srt_filter_path = srt_path.replace("\\", "/").replace(":", "\\:")
-
-    # Alignment=2 keeps captions bottom-anchored (not floating mid-frame if a line
-    # is short), MarginV pushes them up from the very bottom edge in pixels.
-    style = (
-        f"FontName={font_name},FontSize=17,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,Outline=1,Shadow=1,"
-        "Alignment=2,MarginV=80"
+                  video_width, video_height, max_group_size=6):
+    ass_path = output_path.replace(".mp4", ".ass")
+    captions_to_ass(
+        captions, ass_path,
+        video_width=video_width, video_height=video_height,
+        max_group_size=max_group_size,
     )
+
+    # FFmpeg's subtitle filters need forward slashes and escaped colons on Windows.
+    ass_filter_path = ass_path.replace("\\", "/").replace(":", "\\:")
 
     cmd = [
         "ffmpeg", "-y",
         "-loop", "1",
         "-i", image_path,
         "-i", audio_path,
-        "-vf", f"subtitles='{srt_filter_path}':force_style='{style}'",
+        "-vf", f"ass='{ass_filter_path}'",
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-c:a", "aac",
@@ -98,7 +178,7 @@ def render_scene(image_path, audio_path, captions, output_path,
 
     if result.returncode != 0:
         print("FFmpeg failed:")
-        print(result.stderr[-2000:])  # last part of the error log, usually the useful bit
+        print(result.stderr[-2000:])
         return False
 
     print(f"Rendered: {output_path}")
@@ -116,4 +196,6 @@ if __name__ == "__main__":
         audio_path=scene["audio_path"],
         captions=scene["captions"],
         output_path="project_output/scene_0_test.mp4",
+        video_width=project.get("video_width", 1080),
+        video_height=project.get("video_height", 1920),
     )
