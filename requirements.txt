@@ -1,3 +1,4 @@
 requests==2.34.2
 edge-tts==7.2.8
 faster-whisper==1.2.1
+flet==1.0.0

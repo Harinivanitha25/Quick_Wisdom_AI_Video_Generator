@@ -1,4 +1,6 @@
+import glob
 import json
+import os
 import re
 import subprocess
 
@@ -92,14 +94,55 @@ def concatenate_with_transitions(video_paths, output_path,
     return True
 
 
+def add_watermark(input_path, output_path, watermark_path, video_width,
+                  watermark_width=120, opacity=0.65,top_margin=80,right_margin=40, ):
+    """Add a small semi-transparent watermark in the top-right corner."""
+    if not os.path.exists(watermark_path):
+        print(f"Watermark not found: {watermark_path}")
+        return False
+
+    filter_complex = (
+        f"[1:v]format=rgba,scale={watermark_width}:-1,"
+        f"colorchannelmixer=aa={opacity}[wm];"
+        f"[0:v][wm]overlay=x=W-w-{right_margin}:y={top_margin}:format=auto[v]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-i", watermark_path,
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-crf", "18",
+        "-preset", "medium",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        output_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print("Watermark failed:")
+        print(result.stderr[-3000:])
+        return False
+
+    print(f"Watermark added: {output_path}")
+    return True
+
+
 def concatenate_videos(video_paths, output_path):
-    list_path = "project_output/concat_list.txt"
+    list_dir = os.path.dirname(output_path) or "."
+    list_path = f"{list_dir}/concat_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
         for path in video_paths:
             # Paths in the concat list are resolved relative to concat_list.txt's
-            # own folder (project_output/), so strip that prefix here to avoid
-            # it being doubled up (project_output/project_output/...).
-            filename = path.replace("project_output/", "").replace(chr(92), "/")
+            # own folder, so write each clip's path relative to that folder.
+            filename = os.path.relpath(path, list_dir).replace(chr(92), "/")
             f.write(f"file '{filename}'\n")
 
     cmd = [
@@ -122,7 +165,14 @@ def concatenate_videos(video_paths, output_path):
     return True
 
 
-def build_full_video(project_path="project_output/project.json"):
+def build_full_video(project_path):
+    """Render every scene of one project and join them into its final video.
+    project_path is that project's project.json; everything is written inside
+    the folder it lives in. Returns the final video's path, or None if the
+    build failed."""
+    project_dir = os.path.dirname(project_path)
+    os.makedirs(f"{project_dir}/scenes", exist_ok=True)
+
     with open(project_path) as f:
         project = json.load(f)
 
@@ -136,7 +186,7 @@ def build_full_video(project_path="project_output/project.json"):
 
     for i, scene in enumerate(project["scenes"]):
         print(f"Rendering scene {i + 1}/{len(project['scenes'])}...")
-        output_path = f"project_output/scene_{i}.mp4"
+        output_path = f"{project_dir}/scenes/scene_{i}.mp4"
 
         ok = render_scene(
             image_path=scene["image_path"],
@@ -155,13 +205,49 @@ def build_full_video(project_path="project_output/project.json"):
 
     if not scene_videos:
         print("No scenes rendered successfully, stopping.")
-        return
+        return None
 
     print(f"\nJoining {len(scene_videos)} scenes with transitions...")
     filename = slugify(project["title"])
-    output_path = f"project_output/{filename}.mp4"
-    concatenate_with_transitions(scene_videos, output_path, transition="fade", transition_duration=0.5)
+    output_path = f"{project_dir}/{filename}.mp4"
+    ok = concatenate_with_transitions(scene_videos, output_path, transition="fade", transition_duration=0.5)
+    if not ok:
+        return None
+
+    # Option 1: one fixed watermark is added to the completed video.
+    # Put your transparent PNG at: assets/watermark.png next to build_full_video.py
+    watermark_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "assets", "watermark.png"
+    )
+    watermarked_path = f"{project_dir}/{filename}_watermarked.mp4"
+
+    watermark_ok = add_watermark(
+        input_path=output_path,
+        output_path=watermarked_path,
+        watermark_path=watermark_path,
+        video_width=video_width,
+        watermark_width=140 if video_width <= 1080 else 200,
+        opacity=1,
+        top_margin=80 if video_width <= 1080 else 60,
+        right_margin=40,
+    )
+
+    if watermark_ok:
+        # Replace the unwatermarked final video with the watermarked version.
+        os.replace(watermarked_path, output_path)
+        print(f"\nFinal video with top-right watermark saved: {output_path}")
+        return output_path
+
+    # If the watermark image is missing, keep the normal final video.
+    print("Watermark was not added; keeping the normal final video.")
+    return output_path
 
 
 if __name__ == "__main__":
-    build_full_video()
+    # Run standalone: build the newest project (folder names start with a
+    # timestamp, so the last one alphabetically is the most recent).
+    projects = sorted(glob.glob("project_output/*/project.json"))
+    if projects:
+        build_full_video(projects[-1].replace(chr(92), "/"))
+    else:
+        print("No projects found in project_output/.")

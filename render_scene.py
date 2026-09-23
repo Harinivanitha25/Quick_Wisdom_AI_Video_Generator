@@ -1,3 +1,4 @@
+import glob
 import json
 import re
 import string
@@ -196,7 +197,10 @@ def render_scene(image_path, audio_path, captions, output_path,
 
 
 if __name__ == "__main__":
-    with open("project_output/project.json") as f:
+    # Test on the newest project (folder names start with a timestamp).
+    project_json = sorted(glob.glob("project_output/*/project.json"))[-1].replace("\\", "/")
+    project_dir = project_json.rsplit("/", 1)[0]
+    with open(project_json) as f:
         project = json.load(f)
 
     scene = project["scenes"][0]  # first scene only, for this test
@@ -205,7 +209,7 @@ if __name__ == "__main__":
         image_path=scene["image_path"],
         audio_path=scene["audio_path"],
         captions=scene["captions"],
-        output_path="project_output/scene_0_test.mp4",
+        output_path=f"{project_dir}/scenes/scene_0_test.mp4",
         video_width=project.get("video_width", 1080),
         video_height=project.get("video_height", 1920),
     )
