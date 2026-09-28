@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import difflib
 import io
 import json
 import os
@@ -11,6 +12,30 @@ import threading
 import time
 
 import flet as ft
+import webbrowser
+
+# When launched without a console (pythonw), stop ffmpeg/ffprobe from
+# flashing a black window every time they run.
+if sys.platform == "win32":
+    _orig_popen_init = subprocess.Popen.__init__
+
+    def _quiet_popen_init(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        _orig_popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _quiet_popen_init
+
+    
+# YouTube upload needs the google-api-python-client / google-auth-oauthlib
+# packages and client_secret.json. If the packages are missing, the Upload
+# button shows a message instead of crashing the app.
+try:
+    from youtube_upload import upload_video, YouTubeUploadError
+except ImportError:
+    upload_video = None
+
+    class YouTubeUploadError(Exception):
+        pass
 
 # Anchored to this file's own location, not whatever folder the app happened
 # to be launched from. The backend writes to "project_output/..." relative to
@@ -80,6 +105,74 @@ def load_project(project_dir):
 def save_project(project, project_dir):
     with open(project_json_path(project_dir), "w", encoding="utf-8") as f:
         json.dump(project, f, indent=2)
+
+
+def realign_captions(old_words, new_texts):
+    """Rebuild a scene's caption list after a free-text edit, keeping every
+    word's real start/end (from Whisper's transcription of the actual TTS
+    audio) wherever the word is unchanged, so timing stays correct instead
+    of drifting. Uses difflib to line up old_words (list of {start, end,
+    word}) against new_texts (list of plain strings from the edited box):
+    matched stretches keep their original timestamps exactly; only an
+    inserted/replaced stretch gets new timestamps, interpolated across the
+    time span its old words covered (proportional to each new word's
+    length) so the result stays monotonic and lines up with nearby words
+    that didn't change."""
+    old_norm = [w["word"].strip().lower() for w in old_words]
+    new_norm = [t.strip().lower() for t in new_texts]
+    matcher = difflib.SequenceMatcher(a=old_norm, b=new_norm, autojunk=False)
+
+    rebuilt = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                old_word = old_words[i1 + k]
+                rebuilt.append({
+                    "start": old_word["start"], "end": old_word["end"],
+                    "word": new_texts[j1 + k],
+                })
+            continue
+
+        new_slice = new_texts[j1:j2]
+        if not new_slice:
+            continue  # a delete: those old words are simply dropped
+
+        # Anchor the replaced/inserted span to the timing around it.
+        if i2 > i1:
+            # A replacement: spans the old words actually being replaced.
+            span_start = old_words[i1]["start"]
+            span_end = old_words[i2 - 1]["end"]
+        else:
+            # A pure insertion (i1 == i2, no old words consumed): use the
+            # real gap between the previous word's end and the next word's
+            # start, never a word's own start twice over, so the inserted
+            # word can't end up sharing a timestamp with its neighbor.
+            span_start = old_words[i1 - 1]["end"] if i1 > 0 else 0.0
+            span_end = old_words[i1]["start"] if i1 < len(old_words) else span_start + 0.4 * len(new_slice)
+
+        span_end = max(span_end, span_start + 0.05 * len(new_slice))
+        total_chars = sum(max(1, len(t)) for t in new_slice)
+        cursor = span_start
+        for t in new_slice:
+            portion = (max(1, len(t)) / total_chars) * (span_end - span_start)
+            word_end = cursor + portion
+            rebuilt.append({"start": cursor, "end": word_end, "word": t})
+            cursor = word_end
+
+    # Guarantee strictly increasing start times even when the original
+    # transcription had zero gap between two adjacent words (so an inserted
+    # word had no real room to land in): nudge each word forward by the
+    # smallest amount needed rather than letting it share a timestamp with
+    # (or start before) the word right before it.
+    min_gap = 0.02
+    for k in range(1, len(rebuilt)):
+        min_start = rebuilt[k - 1]["start"] + min_gap
+        if rebuilt[k]["start"] < min_start:
+            rebuilt[k]["start"] = min_start
+        if rebuilt[k]["end"] <= rebuilt[k]["start"]:
+            rebuilt[k]["end"] = rebuilt[k]["start"] + min_gap
+
+    return rebuilt
 
 
 def find_project_video(project_dir, project):
@@ -220,6 +313,30 @@ def probe_video_size(path):
     except Exception:
         return None
 
+def make_video_player(video_path, max_w, max_h, autoplay=True):
+    """A video player sized to fit inside max_w x max_h while keeping the
+    video's own aspect ratio. Falls back to an install hint if flet-video
+    isn't available. Returns the sized container."""
+    width, height = probe_video_size(video_path) or (1080, 1920)
+    fit_scale = min(max_w / width, max_h / height)
+    box_w, box_h = round(width * fit_scale), round(height * fit_scale)
+
+    if ftv is not None:
+        player = ftv.Video(expand=True, playlist=[ftv.VideoMedia(video_path)], autoplay=autoplay)
+    else:
+        player = ft.Column(
+            alignment=ft.MainAxisAlignment.CENTER,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Text("In-app playback needs the flet-video package.", size=13, color=TEXT_MUTED),
+                ft.Text("pip install flet-video", size=13, color=SAGE, selectable=True),
+            ],
+        )
+
+    return ft.Container(
+        width=box_w, height=box_h, bgcolor="#000000", border_radius=12,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS, content=player,
+    )
 
 # --- Live log ----------------------------------------------------------
 # The generation/build code reports progress with print() (Gemini errors,
@@ -535,32 +652,14 @@ def main(page: ft.Page):
 
     # --- In-app player (opened by the library's Play button) -----------
     def player_screen(video_path, title):
-        width, height = probe_video_size(video_path) or (1080, 1920)
-        fit_scale = min(PLAYER_MAX_W / width, PLAYER_MAX_H / height)
-        box_w, box_h = round(width * fit_scale), round(height * fit_scale)
+        player_box = make_video_player(video_path, PLAYER_MAX_W, PLAYER_MAX_H)
+        box_w = player_box.width
 
         def on_back_click(e):
             show_screen(library_screen(), top_align=True)
 
         def on_system_player_click(e):
             open_in_system_player(video_path)
-
-        if ftv is not None:
-            player = ftv.Video(expand=True, playlist=[ftv.VideoMedia(video_path)], autoplay=True)
-        else:
-            player = ft.Column(
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Text("In-app playback needs the flet-video package.", size=13, color=TEXT_MUTED),
-                    ft.Text("pip install flet-video", size=13, color=SAGE, selectable=True),
-                ],
-            )
-
-        player_box = ft.Container(
-            width=box_w, height=box_h, bgcolor="#000000", border_radius=12,
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS, content=player,
-        )
 
         return ft.Container(
             width=max(box_w + 64, 560), padding=24, border_radius=16, bgcolor=BG,
@@ -1009,84 +1108,138 @@ def main(page: ft.Page):
             color=TEXT, text_size=13, border_radius=8, height=44,width=450,
         )
 
-        # One list of caption-word TextFields per scene, in the same order as
-        # that scene's captions list, so edits can be written straight back by
-        # index on Save/Build - no need to touch each word's start/end timing.
-        scene_caption_fields = []
+        # Words are edited straight into project["scenes"][i]["captions"][j]
+        # ("word" dict entries) the moment a tap-to-edit field is committed,
+        # so no separate pull-back-into-project step is needed on Save/Build.
+        # Fixed card geometry so every scene card is exactly the same size:
+        # the image fills the card's inner width, the narration and caption
+        # boxes have fixed heights (3 lines each), so nothing depends on how
+        # long a scene's text happens to be.
+        CARD_W = 280
+        CARD_PAD = 12
+        INNER_W = CARD_W - 2 * CARD_PAD
+        NARRATION_H = 48
+        CAPTION_HEADER_H = 24
+        CAPTION_BOX_H = 88
+        CAPTION_NOTE_H = 14
+        CAPTIONS_BLOCK_H = CAPTION_HEADER_H + CAPTION_BOX_H + CAPTION_NOTE_H + 2 * 6
+        # Same aspect ratio as the project's video, so 9:16 and 16:9 projects
+        # both show the whole frame at the card's full inner width.
+        frame_w = project.get("video_width") or 1080
+        frame_h = project.get("video_height") or 1920
+        IMAGE_H = round(INNER_W * frame_h / frame_w)
+        CARD_H = CARD_PAD * 2 + IMAGE_H + 16 + NARRATION_H + CAPTIONS_BLOCK_H + 3 * 6 + 6
 
-        def make_caption_word_field(word_text):
-            return ft.TextField(
-                value=word_text.strip(),
-                width=max(46, 9 * len(word_text.strip()) + 24),
-                height=34,
-                text_size=12,
-                text_align=ft.TextAlign.CENTER,
-                dense=True,
-                content_padding=ft.Padding.symmetric(horizontal=6, vertical=4),
-                bgcolor=BG,
-                border_color=BORDER,
-                focused_border_color=SAGE,
-                color=TEXT,
-                border_radius=6,
+        def build_caption_preview(scene):
+            """Simple free-text caption editor: the whole caption line for the
+            scene in one editable box, plus a Reset link back to the
+            originally-generated words. Edits are re-split on whitespace and
+            realigned against the original words (see realign_captions), so
+            an unchanged word keeps its real transcribed timing exactly, and
+            only a genuinely added/changed word gets interpolated timing."""
+            captions = scene.get("captions", [])
+            if not captions:
+                return ft.Container(height=CAPTIONS_BLOCK_H)
+
+            # Deep-copied snapshot of the originally-generated words, so Reset
+            # always restores this scene's pristine captions even after
+            # several edits in the same sitting.
+            original_captions = [dict(w) for w in captions]
+            original_text = " ".join(w["word"].strip() for w in original_captions)
+
+            caption_field = ft.TextField(
+                value=original_text, width=INNER_W,
+                multiline=True, min_lines=3, max_lines=3,
+                text_size=14, color=TEXT,
+                bgcolor=BG, border_color=BORDER, focused_border_color=SAGE,
+                border_radius=8, content_padding=ft.Padding.symmetric(horizontal=12, vertical=10),
+            )
+
+            def commit_text(e):
+                new_words = (caption_field.value or "").split()
+                if not new_words:
+                    # An emptied-out box keeps the current captions rather
+                    # than committing blank, since no caption words would
+                    # break the subtitle rendering.
+                    caption_field.value = " ".join(w["word"].strip() for w in scene["captions"])
+                    page.update()
+                    return
+                old = scene.get("captions") or original_captions
+                scene["captions"] = realign_captions(old, new_words)
+
+            caption_field.on_blur = commit_text
+            caption_field.on_submit = commit_text
+
+            def on_reset(e):
+                scene["captions"] = [dict(w) for w in original_captions]
+                caption_field.value = original_text
+                page.update()
+
+            return ft.Column(
+                spacing=6,
+                controls=[
+                    ft.Row(
+                        height=CAPTION_HEADER_H,
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        controls=[
+                            ft.Text("Captions", size=12, color=SAGE, weight=ft.FontWeight.W_500),
+                            ft.TextButton(
+                                "Reset", on_click=on_reset,
+                                style=ft.ButtonStyle(color=TEXT_MUTED, padding=0),
+                            ),
+                        ],
+                    ),
+                    ft.Container(content=caption_field, height=CAPTION_BOX_H, width=INNER_W),
+                    ft.Container(
+                        height=CAPTION_NOTE_H,
+                        content=ft.Text(
+                            "Words stay lined up with the timing automatically.",
+                            size=10, color=TEXT_MUTED, max_lines=1,
+                        ),
+                    ),
+                ],
             )
 
         scene_cards = []
         for i, scene in enumerate(project["scenes"]):
             image_preview = (
-                ft.Image(src=scene["image_path"], width=200, border_radius=6, fit=ft.BoxFit.COVER)
+                ft.Image(
+                    src=scene["image_path"], width=INNER_W, height=IMAGE_H,
+                    border_radius=6, fit=ft.BoxFit.COVER,
+                )
                 if scene.get("image_path")
-                else ft.Container(width=200, height=240, bgcolor=BG, border_radius=6)
+                else ft.Container(width=INNER_W, height=IMAGE_H, bgcolor=BG, border_radius=6)
             )
 
-            caption_fields = [make_caption_word_field(word["word"]) for word in scene.get("captions", [])]
-            scene_caption_fields.append(caption_fields)
-            captions_block = (
-                ft.Column(
-                    spacing=4,
-                    controls=[
-                        ft.Text("Captions", size=10, color=SAGE, weight=ft.FontWeight.W_500),
-                        ft.Row(controls=caption_fields, spacing=4, run_spacing=4, wrap=True),
-                    ],
-                )
-                if caption_fields
-                else ft.Container()
-            )
+            captions_block = build_caption_preview(scene)
 
             scene_cards.append(
                 ft.Container(
                     bgcolor=SURFACE, border_radius=10, border=ft.Border.all(0.5, BORDER),
-                    padding=12, width=280,
+                    padding=CARD_PAD, width=CARD_W, height=CARD_H,
                     content=ft.Column(
                         spacing=6,
                         controls=[
                             image_preview,
                             ft.Text(f"Scene {i + 1}", size=11, color=SAGE),
-                            ft.Text(scene["narration"], size=11, color=TEXT_MUTED, max_lines=3),
+                            ft.Container(
+                                height=NARRATION_H, width=INNER_W,
+                                content=ft.Text(
+                                    scene["narration"], size=11, color=TEXT_MUTED,
+                                    max_lines=3, overflow=ft.TextOverflow.ELLIPSIS,
+                                ),
+                            ),
                             captions_block,
                         ],
                     ),
                 )
             )
 
-        def apply_caption_edits():
-            """Pull every scene's edited caption words back into project["scenes"]
-            before it's saved. An emptied-out field keeps its original word
-            rather than being saved as blank, since an empty caption word
-            would break the subtitle groups built from it at render time."""
-            for scene, caption_fields in zip(project["scenes"], scene_caption_fields):
-                captions = scene.get("captions", [])
-                for word, field in zip(captions, caption_fields):
-                    new_word = (field.value or "").strip()
-                    if new_word:
-                        word["word"] = new_word
-                    else:
-                        field.value = word["word"].strip()
-
         status_text = ft.Text("", size=13, color=SAGE, visible=False)
 
         def on_save_click(e):
             project["title"] = title_field.value
-            apply_caption_edits()
             save_project(project, project_dir)
             status_text.value = "Saved."
             status_text.visible = True
@@ -1094,7 +1247,6 @@ def main(page: ft.Page):
 
         async def on_build_click(e):
             project["title"] = title_field.value
-            apply_caption_edits()
             save_project(project, project_dir)
 
             log = LogPanel()
@@ -1141,10 +1293,8 @@ def main(page: ft.Page):
                 spacing=16,
                 controls=[
                     back_button,
-                    ft.Column(spacing=4, controls=[label("Video title"), title_field]),
-                    ft.Divider(color=BORDER),
                     ft.Text(f"{len(project['scenes'])} scenes", size=12, color=TEXT_MUTED),
-                    ft.Row(controls=scene_cards, spacing=12, wrap=True),
+                    ft.Row(controls=scene_cards, spacing=12, run_spacing=12, wrap=True, vertical_alignment=ft.CrossAxisAlignment.START),
                     ft.Row(controls=[save_button, build_button, status_text], spacing=12),
                 ],
             ),
@@ -1152,8 +1302,17 @@ def main(page: ft.Page):
 
     # --- Build success: shown right after rendering, before the final review ---
     def build_success_screen(project, video_path):
+        # Smaller than the library player so the Continue button stays on
+        # screen for both 9:16 and 16:9 videos.
+        PREVIEW_MAX_W = 640
+        PREVIEW_MAX_H = 440
+        player_box = make_video_player(video_path, PREVIEW_MAX_W, PREVIEW_MAX_H, autoplay=False)
+
         def on_continue_click(e):
             show_screen(final_review_screen(project, video_path))
+
+        def on_system_player_click(e):
+            open_in_system_player(video_path)
 
         continue_button = ft.Button(
             content=ft.Row(
@@ -1165,21 +1324,41 @@ def main(page: ft.Page):
         )
 
         return ft.Container(
-            width=700, padding=32, border_radius=16, bgcolor=BG,
+            width=max(player_box.width + 64, 700), padding=32, border_radius=16, bgcolor=BG,
             border=ft.Border.all(0.5, BORDER),
             content=ft.Column(
                 spacing=16,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     ft.Icon(ft.Icons.CHECK_CIRCLE, color=SAGE, size=32),
                     ft.Text("Video built successfully", size=22, weight=ft.FontWeight.W_500, color=TEXT),
-                    ft.Text(video_path, size=12, color=TEXT_MUTED),
-                    continue_button,
+                    ft.Text(video_path, size=12, color=TEXT_MUTED, selectable=True),
+                    player_box,
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=12,
+                        controls=[
+                            ft.Button(
+                                content=ft.Row(
+                                    controls=[ft.Icon(ft.Icons.OPEN_IN_NEW, size=14),
+                                              ft.Text("Open in system player", size=13)],
+                                    spacing=6,
+                                ),
+                                style=ft.ButtonStyle(bgcolor=SURFACE, color=TEXT_MUTED),
+                                on_click=on_system_player_click,
+                            ),
+                            continue_button,
+                        ],
+                    ),
                 ],
             ),
         )
 
     # --- Post-build: play video + editable metadata + upload stub -----
+        # --- Post-build: play video + editable metadata + upload to YouTube ---
     def final_review_screen(project, video_path):
+        project_dir = os.path.dirname(video_path)
+
         yt_title_field = ft.TextField(
             value=project["youtube_metadata"].get("youtube_title", ""),
             bgcolor=SURFACE, border_color=BORDER, focused_border_color=SAGE,
@@ -1188,36 +1367,130 @@ def main(page: ft.Page):
         description_field = ft.TextField(
             value=project["youtube_metadata"].get("description", ""),
             multiline=True, min_lines=2, max_lines=6,
-            bgcolor=SURFACE, border_color=BORDER, focused_border_color=SAGE,width=735,
+            bgcolor=SURFACE, border_color=BORDER, focused_border_color=SAGE, width=735,
             color=TEXT, text_size=13, border_radius=8,
         )
         tags_field = ft.TextField(
             value=", ".join(project["youtube_metadata"].get("tags", [])),
             bgcolor=SURFACE, border_color=BORDER, focused_border_color=SAGE,
             multiline=True, min_lines=2, max_lines=4,
-            color=TEXT, text_size=13, border_radius=8,width=735,
+            color=TEXT, text_size=13, border_radius=8, width=735,
         )
+
+        TITLE_LIMIT = 100  # YouTube's title limit
+        title_count = ft.Text("", size=11, color=TEXT_MUTED)
+
+        def update_title_count(e=None):
+            length = len(yt_title_field.value or "")
+            title_count.value = f"{length} / {TITLE_LIMIT} characters"
+            title_count.color = ft.Colors.RED_300 if length > TITLE_LIMIT else TEXT_MUTED
+            if e is not None:
+                page.update()
+
+        yt_title_field.on_change = update_title_count
+        update_title_count()
 
         status_text = ft.Text("", size=13, color=SAGE, visible=False)
         upload_status = ft.Text("", size=12, color=TEXT_MUTED, visible=False)
+        upload_log = LogPanel(width=735, height=120)
+        upload_log.control.visible = False
+        link_text = ft.Text("", size=13, color=SAGE, selectable=True, visible=False)
+
+        # Visibility chips (same style as the duration chips on the new-project screen).
+        privacy = {"value": "private"}
+        privacy_chips = {}
+
+        def style_privacy_chips():
+            for value, chip in privacy_chips.items():
+                selected = privacy["value"] == value
+                chip.bgcolor = SAGE if selected else "transparent"
+                chip.border = ft.Border.all(1, SAGE if selected else BORDER)
+                chip.content.color = TEXT_ON_SAGE if selected else TEXT_MUTED
+
+        def on_privacy_click(value):
+            def handler(e):
+                privacy["value"] = value
+                style_privacy_chips()
+                page.update()
+            return handler
+
+        chip_row_controls = []
+        for value in ("private", "unlisted", "public"):
+            chip = ft.Container(
+                content=ft.Text(value.capitalize(), size=13),
+                padding=ft.Padding.symmetric(horizontal=14, vertical=6),
+                border_radius=20,
+                on_click=on_privacy_click(value),
+            )
+            privacy_chips[value] = chip
+            chip_row_controls.append(chip)
+        style_privacy_chips()
+
+        def collect_metadata():
+            project["youtube_metadata"]["youtube_title"] = yt_title_field.value
+            project["youtube_metadata"]["description"] = description_field.value
+            project["youtube_metadata"]["tags"] = [t.strip() for t in tags_field.value.split(",") if t.strip()]
+            save_project(project, project_dir)
 
         def on_back_click(e):
             show_screen(library_screen(), top_align=True)
 
         def on_save_metadata_click(e):
-            project["youtube_metadata"]["youtube_title"] = yt_title_field.value
-            project["youtube_metadata"]["description"] = description_field.value
-            project["youtube_metadata"]["tags"] = [t.strip() for t in tags_field.value.split(",") if t.strip()]
-            save_project(project, os.path.dirname(video_path))
+            collect_metadata()
             status_text.value = "Metadata saved."
             status_text.visible = True
             page.update()
 
-        def on_upload_click(e):
-            upload_status.value = "YouTube upload isn't implemented yet."
+        def on_open_link_click(e):
+            url = project.get("youtube_url")
+            if url:
+                webbrowser.open(url)
+
+        def show_upload_error(message):
+            upload_status.value = message
+            upload_status.color = ft.Colors.RED_300
             upload_status.visible = True
+            upload_button.disabled = False
             page.update()
 
+        async def on_upload_click(e):
+            title = (yt_title_field.value or "").strip()
+            if upload_video is None:
+                show_upload_error("Uploading needs: pip install google-api-python-client "
+                                  "google-auth-oauthlib google-auth-httplib2")
+                return
+            if not title:
+                show_upload_error("Enter a YouTube title first.")
+                return
+            if len(title) > TITLE_LIMIT:
+                show_upload_error(f"The title is {len(title)} characters; YouTube allows {TITLE_LIMIT}.")
+                return
+
+            collect_metadata()  # upload exactly what's in the boxes, and keep it saved
+            meta = project["youtube_metadata"]
+
+            upload_button.disabled = True
+            upload_status.visible = False
+            upload_log.control.visible = True
+            page.update()
+
+            try:
+                video_id, url = await run_with_log(
+                    upload_log, upload_video, video_path,
+                    meta["youtube_title"], meta["description"], meta["tags"], privacy["value"],
+                )
+            except YouTubeUploadError as ex:
+                show_upload_error(f"Upload failed: {ex}")
+                return
+            except Exception as ex:
+                show_upload_error(f"Unexpected error: {ex}")
+                return
+
+            project["youtube_video_id"] = video_id
+            project["youtube_url"] = url
+            save_project(project, project_dir)
+            show_uploaded(url)
+            page.update()
 
         back_button = ft.Button("Back to library", style=ft.ButtonStyle(bgcolor=BORDER, color=TEXT), on_click=on_back_click)
         save_meta_button = ft.Button("Save metadata", style=ft.ButtonStyle(bgcolor=SURFACE, color=TEXT), on_click=on_save_metadata_click)
@@ -1226,10 +1499,27 @@ def main(page: ft.Page):
                 controls=[ft.Icon(ft.Icons.CLOUD_UPLOAD, size=16), ft.Text("Upload to YouTube", size=14)],
                 spacing=8, alignment=ft.MainAxisAlignment.CENTER,
             ),
-            style=ft.ButtonStyle(bgcolor=BORDER, color=TEXT_MUTED), height=46,
+            style=ft.ButtonStyle(bgcolor=SAGE, color=TEXT_ON_SAGE), height=46,
             on_click=on_upload_click,
         )
-       
+        open_link_button = ft.Button(
+            "Open on YouTube", style=ft.ButtonStyle(bgcolor=SURFACE, color=TEXT),
+            visible=False, on_click=on_open_link_click,
+        )
+
+        def show_uploaded(url):
+            link_text.value = url
+            link_text.visible = True
+            open_link_button.visible = True
+            upload_button.disabled = True
+            upload_status.value = "Uploaded. You can change details later in YouTube Studio."
+            upload_status.color = SAGE
+            upload_status.visible = True
+
+        # A video that was already uploaded shows its link instead of a fresh upload.
+        if project.get("youtube_url"):
+            show_uploaded(project["youtube_url"])
+
         return ft.Container(
             width=800, padding=32, border_radius=16, bgcolor=BG,
             border=ft.Border.all(0.5, BORDER),
@@ -1238,18 +1528,31 @@ def main(page: ft.Page):
                 controls=[
                     back_button,
                     ft.Divider(color=BORDER),
-                    ft.Column(spacing=4, controls=[label("YouTube title"), yt_title_field]),
+                    ft.Column(spacing=4, controls=[label("YouTube title"), yt_title_field, title_count]),
                     ft.Column(spacing=4, controls=[label("Description"), description_field]),
                     ft.Column(spacing=4, controls=[label("Tags (comma separated)"), tags_field]),
                     ft.Row(controls=[save_meta_button, status_text], spacing=12),
                     ft.Divider(color=BORDER),
+                    ft.Column(
+                        spacing=8,
+                        controls=[
+                            label("Visibility"),
+                            ft.Row(controls=chip_row_controls, spacing=8),
+                            ft.Text(
+                                "Until your Google project passes YouTube's audit, uploads stay "
+                                "private whatever you choose here.",
+                                size=11, color=TEXT_MUTED,
+                            ),
+                        ],
+                    ),
                     upload_button,
                     upload_status,
-                    
+                    upload_log.control,
+                    ft.Row(controls=[link_text, open_link_button], spacing=12,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ],
             ),
         )
-
     # --- Building / failed screens --------------------------------------
     def building_screen(log: LogPanel):
         return ft.Container(

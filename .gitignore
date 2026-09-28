@@ -4,3 +4,7 @@ config.py
 __pycache__/
 assets/
 *.pyc
+client_secret.json
+token.json
+logo.ico
+logo.png

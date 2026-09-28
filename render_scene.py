@@ -149,7 +149,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def render_scene(image_path, audio_path, captions, output_path,
-                  video_width, video_height, max_group_size=6):
+                  video_width, video_height, max_group_size=6, gap_seconds=0.0):
     ass_path = output_path.replace(".mp4", ".ass")
     captions_to_ass(
         captions, ass_path,
@@ -184,6 +184,15 @@ def render_scene(image_path, audio_path, captions, output_path,
         "-shortest",
         output_path,
     ]
+
+    if gap_seconds > 0:
+        # Extend the audio with trailing silence; the video is a single
+        # looping still image bound to -shortest, so it automatically holds
+        # that same frame for the extra time rather than needing its own
+        # padding. The captions' .ass file has nothing scheduled past the
+        # last spoken word, so no caption text shows during the pause.
+        af_index = cmd.index("-c:v")
+        cmd[af_index:af_index] = ["-af", f"apad=pad_dur={gap_seconds}"]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 

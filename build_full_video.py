@@ -6,6 +6,15 @@ import subprocess
 
 from render_scene import render_scene
 
+# Silence + held-frame padding added to the end of every scene except the
+# last, so scenes get real breathing room instead of running straight into
+# each other (or, previously, overlapping during the crossfade). The 0.5s
+# crossfade below still blends smoothly into this padding, so the fully
+# silent/still portion the viewer perceives is a bit less than this number -
+# tuned to land in the 1-1.5s range once that's accounted for.
+SCENE_GAP_SECONDS = 1.2
+
+
 def slugify(text, max_length=60):
     """Turn a title into a safe filename: lowercase, spaces to underscores,
     strip anything that isn't a letter/number/underscore/hyphen."""
@@ -187,6 +196,7 @@ def build_full_video(project_path):
     for i, scene in enumerate(project["scenes"]):
         print(f"Rendering scene {i + 1}/{len(project['scenes'])}...")
         output_path = f"{project_dir}/scenes/scene_{i}.mp4"
+        is_last_scene = i == len(project["scenes"]) - 1
 
         ok = render_scene(
             image_path=scene["image_path"],
@@ -196,6 +206,7 @@ def build_full_video(project_path):
             video_width=video_width,
             video_height=video_height,
             max_group_size=6,
+            gap_seconds=0.0 if is_last_scene else SCENE_GAP_SECONDS,
         )
 
         if ok:
